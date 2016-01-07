@@ -461,6 +461,8 @@ srtp_stream_clone(const srtp_stream_ctx_t *stream_template,
   str->enc_xtn_hdr = stream_template->enc_xtn_hdr;
   str->enc_xtn_hdr_count = stream_template->enc_xtn_hdr_count;
 
+  str->trailer_bo = stream_template->trailer_bo;
+
   /* defensive coding */
   str->next = NULL;
 
@@ -2986,7 +2988,7 @@ srtp_protect_rtcp_aead (srtp_t ctx, srtp_stream_ctx_t *stream,
     /* 
      * put the idx# into network byte order and process it as AAD
      */
-    tseq = htonl(*trailer);
+    tseq = *trailer;
     status = srtp_cipher_set_aad(stream->rtcp_cipher, (uint8_t*)&tseq, sizeof(srtcp_trailer_t));
     if (status) {
         return ( srtp_err_status_cipher_fail);
@@ -3133,7 +3135,15 @@ srtp_unprotect_rtcp_aead (srtp_t ctx, srtp_stream_ctx_t *stream,
     /* 
      * put the idx# into network byte order, and process it as AAD 
      */
-    tseq = htonl(*trailer);
+    if (stream->trailer_bo == srtp_trailer_le) {
+	/* 
+	 * This is an unfortunate hack to allow for backwards compatiblity with legacy versions
+	 * of libsrtp that didn't comply with the byte ordering required in the RFC. 
+	 */
+	tseq = htonl(*trailer); 
+    } else {
+	tseq = *trailer; 
+    }
     status = srtp_cipher_set_aad(stream->rtcp_cipher, (uint8_t*)&tseq, sizeof(srtcp_trailer_t));
     if (status) {
 	return ( srtp_err_status_cipher_fail);
@@ -3196,6 +3206,12 @@ srtp_unprotect_rtcp_aead (srtp_t ctx, srtp_stream_ctx_t *stream,
         if (status) {
             return status;
         }
+
+	/* if we made it through decryption and the trailer ordering is
+	 * unknown, it must have been big endian ordering */
+        if (stream->trailer_bo == srtp_trailer_unknown) {
+	    new_stream->trailer_bo = srtp_trailer_be; 
+	}
 
         /* add new stream to the head of the stream_list */
         new_stream->next = ctx->stream_list;
@@ -3426,6 +3442,7 @@ srtp_unprotect_rtcp(srtp_t ctx, void *srtcp_hdr, int *pkt_octet_len) {
   uint32_t seq_num;
   int e_bit_in_packet;     /* whether the E-bit was found in the packet */
   int sec_serv_confidentiality; /* whether confidentiality was requested */
+  uint8_t *copy = NULL;
 
   /* we assume the hdr is 32-bit aligned to start */
 
@@ -3487,7 +3504,45 @@ srtp_unprotect_rtcp(srtp_t ctx, void *srtcp_hdr, int *pkt_octet_len) {
    */
   if (stream->rtp_cipher->algorithm == SRTP_AES_128_GCM ||
       stream->rtp_cipher->algorithm == SRTP_AES_256_GCM) {
-      return srtp_unprotect_rtcp_aead(ctx, stream, srtcp_hdr, (unsigned int*)pkt_octet_len);
+
+      if (stream->trailer_bo == srtp_trailer_unknown) {
+          /* The problem here is openssl does an inline decrypt.
+             if we need to decrypt twice becasue the first attempt fails,
+             then the data has been trashed for doing the second decrypt.
+             so we need to keep a copy of the data around in the case 
+             of doing the double decrypt for little endian trailer support. */
+          copy = (uint8_t *) srtp_crypto_alloc(*pkt_octet_len);
+          if (!copy) {
+              return srtp_err_status_alloc_fail;
+          }
+          memcpy(copy, srtcp_hdr, *pkt_octet_len);
+      }
+
+      status = srtp_unprotect_rtcp_aead(ctx, stream, srtcp_hdr, (unsigned int*)pkt_octet_len);
+      if (stream->trailer_bo == srtp_trailer_unknown && status == srtp_err_status_auth_fail) {
+          /*
+	   * This is an unfortuante hack required to retain backwards compatibility with
+	   * legacy versions of libsrtp that don't use big endian byte ordering of the
+	   * trailer.  Upon receiving the first RTCP packet, we'll decrypt using a big
+	   * endian trailer.  If that fails, we'll try again using a little endian
+	   * trailer.  We set a flag on the stream context to indicate that little endian
+	   * is used for future packets.
+	   */
+	  stream->trailer_bo = srtp_trailer_le;
+          memcpy(srtcp_hdr, copy, *pkt_octet_len);
+          status = srtp_unprotect_rtcp_aead(ctx, stream, srtcp_hdr, (unsigned int*)pkt_octet_len);
+	  if (status != srtp_err_status_ok) {
+              stream->trailer_bo = srtp_trailer_unknown;
+	  }
+      } 
+      else if (stream->trailer_bo == srtp_trailer_unknown && status == srtp_err_status_ok) {
+	  /*
+	   * We now know the trailer is big endian, prevent the costly memcpy for future packets
+	   */
+	  stream->trailer_bo = srtp_trailer_be;
+      }
+      if (copy) srtp_crypto_free(copy);
+      return status;
   }
 
   sec_serv_confidentiality = stream->rtcp_services == sec_serv_conf ||

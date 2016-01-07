@@ -93,6 +93,15 @@ typedef enum direction_t {
   dir_srtp_receiver = 2
 } direction_t;
 
+/*
+ * Byte ordering of RTCP trailer when AEAD is used
+ */
+typedef enum trailer_byte_order_t { 
+  srtp_trailer_unknown       = 0,
+  srtp_trailer_le   = 1, 
+  srtp_trailer_be   = 2, 
+} trailer_byte_order_t;
+
 /* 
  * an srtp_stream_t has its own SSRC, encryption key, authentication
  * key, sequence number, and replay database
@@ -121,6 +130,7 @@ typedef struct srtp_stream_ctx_t_ {
   int       *enc_xtn_hdr;
   int        enc_xtn_hdr_count;
   struct srtp_stream_ctx_t_ *next;   /* linked list of streams */
+  trailer_byte_order_t trailer_bo;   /* Indicates byte order of RTCP trailer */
 } strp_stream_ctx_t_;
 
 
