@@ -23,6 +23,8 @@ old?
 *.app
 
 # srtp things
+build
+output
 Debug
 Makefile
 Root
